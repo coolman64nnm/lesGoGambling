@@ -219,4 +219,123 @@ async def cmd_inventory(ctx, member: discord.Member = None):
     target = member or ctx.author
     await ensure_user(target.id)
     fish = await get_fish(target.id)
-    nu
+    nukes = await get_item(target.id, "nuke")
+    await ctx.send(f"📦 **{target.display_name}** — Fish: **{fish}** | Nukes: **{nukes}**")
+
+@bot.command(name="buy")
+async def cmd_buy(ctx, item: str, amount: int = 1):
+    item = item.lower()
+    if amount <= 0:
+        return await ctx.send("Amount must be positive.")
+    await ensure_user(ctx.author.id)
+    bal = await get_balance(ctx.author.id)
+    if item == "nuke":
+        cost = NUKE_PRICE * amount
+        if cost > bal:
+            return await ctx.send(f"💸 You need {cost:,} coins to buy {amount} nukes (you have {bal:,}).")
+        await add_balance(ctx.author.id, -cost)
+        await add_item(ctx.author.id, "nuke", amount)
+        await ctx.send(f"✅ Bought {amount} nuke(s) for {cost:,} coins.")
+    else:
+        await ctx.send("Unknown item. Available: `nuke`")
+
+@bot.command(name="nuke")
+@commands.cooldown(1, NUKE_COOLDOWN, commands.BucketType.user)
+async def cmd_nuke(ctx, target: discord.Member):
+    if target.id == ctx.author.id:
+        return await ctx.send("❌ You cannot nuke yourself.")
+    await ensure_user(ctx.author.id)
+    await ensure_user(target.id)
+    nukes = await get_item(ctx.author.id, "nuke")
+    if nukes <= 0:
+        return await ctx.send("💥 You don't have any nukes. Buy one with `!buy nuke`.")
+    target_fish = await get_fish(target.id)
+    if target_fish <= 0:
+        return await ctx.send("🫥 Target has no fish to nuke.")
+
+    # consume nuke
+    await add_item(ctx.author.id, "nuke", -1)
+
+    # determine damage: destroy 10% - 50% of target fish
+    pct = random.randint(10, 50)
+    destroyed = max(1, (target_fish * pct) // 100)
+    # salvage: attacker gets 30% of destroyed (rounded)
+    salvage = max(0, (destroyed * 30) // 100)
+
+    # apply changes
+    new_target_fish = max(0, target_fish - destroyed)
+    await set_fish(target.id, new_target_fish)
+    await add_fish(ctx.author.id, salvage)
+
+    # set cooldown timestamp (also handled by decorator but store for transparency)
+    await set_last_nuke(ctx.author.id, int(time.time()))
+
+    # result message
+    embed = discord.Embed(title="💥 FISH NUKE!", color=0xFF4444)
+    embed.add_field(name="Attacker", value=ctx.author.display_name, inline=True)
+    embed.add_field(name="Target", value=target.display_name, inline=True)
+    embed.add_field(name="Destroyed", value=f"{destroyed} fish ({pct}%)", inline=False)
+    embed.add_field(name="Salvaged", value=f"{salvage} fish → added to {ctx.author.display_name}", inline=False)
+    embed.set_footer(text=f"{ctx.author.display_name} used 1 nuke")
+    await ctx.send(embed=embed)
+
+@cmd_nuke.error
+async def cmd_nuke_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        remaining = int(error.retry_after)
+        hrs = remaining // 3600
+        mins = (remaining % 3600) // 60
+        secs = remaining % 60
+        await ctx.send(f"⏳ Nuke is on cooldown. Try again in {hrs}h {mins}m {secs}s.")
+    else:
+        raise error
+
+@bot.command(name="leaderboard")
+async def cmd_leaderboard(ctx):
+    rows = await top_fish(10)
+    if not rows:
+        return await ctx.send("No fishers yet.")
+    desc = ""
+    pos = 1
+    for user_id, fish_count in rows:
+        member = ctx.guild.get_member(user_id)
+        name = member.display_name if member else f"<@{user_id}>"
+        desc += f"**{pos}.** {name} — {fish_count} fish\n"
+        pos += 1
+    embed = discord.Embed(title="🏆 Fish Leaderboard", description=desc, color=0x00AAFF)
+    await ctx.send(embed=embed)
+
+# Admin tools
+@bot.command(name="give")
+@commands.has_role(ADMIN_ROLE)
+async def cmd_give(ctx, member: discord.Member, amount: int):
+    if amount == 0:
+        return await ctx.send("Amount cannot be zero.")
+    await ensure_user(member.id)
+    await add_balance(member.id, amount)
+    await ctx.send(f"✅ Gave {member.display_name} **{amount:,}** coins.")
+
+@give.error
+async def give_error(ctx, error):
+    if isinstance(error, commands.MissingRole):
+        await ctx.send("❌ You don't have permission to use this command.")
+    else:
+        raise error
+
+@bot.command(name="setbalance")
+@commands.has_role(ADMIN_ROLE)
+async def cmd_setbalance(ctx, member: discord.Member, amount: int):
+    if amount < 0:
+        return await ctx.send("Balance cannot be negative.")
+    await set_balance(member.id, amount)
+    await ctx.send(f"✅ Set {member.display_name}'s balance to **{amount:,}** coins.")
+
+# -------------------------
+# START
+# -------------------------
+if __name__ == "__main__":
+    token = os.getenv("TOKEN")
+    if not token:
+        print("ERROR: TOKEN environment variable not set.")
+    else:
+        bot.run(token)

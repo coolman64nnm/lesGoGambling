@@ -1,232 +1,222 @@
+# main.py
 import os
 import random
+import time
 import asyncio
 import aiosqlite
 import discord
 from discord.ext import commands
 
 # -------------------------
-# CONFIG
+# CONFIG - edit as needed
 # -------------------------
-DATABASE = "economy.db"
+DATABASE = "fishnuke.db"
 PREFIX = "!"
-STARTING_BALANCE = 1000
-DAILY_REWARD = 250
-REELS = ["🍒", "🍋", "🔔", "⭐", "7️⃣", "🍀"]
-PAYOUTS = {
-    "three_same": 5,
-    "two_same": 2,
-    "jackpot_777": 20,
-    "lucky_clover": 10
-}
-ADMIN_ROLE = "777"
-YOUR_DISCORD_ID = 123456789012345678  # <-- replace with your Discord ID
+STARTING_BALANCE = 500
+DAILY_REWARD = 200
+NUKE_PRICE = 500           # coins per nuke
+NUKE_COOLDOWN = 60 * 60 * 6  # 6 hours per user (seconds)
+MAX_CATCH = 6              # max fish you can catch per !fish
+ADMIN_ROLE = "Admin"       # role name for admin commands
+BOT_INTENTS = discord.Intents.default()
+BOT_INTENTS.message_content = True
+BOT_INTENTS.members = True
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-intents.members = True
-
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+bot = commands.Bot(command_prefix=PREFIX, intents=BOT_INTENTS)
 
 # -------------------------
-# Database helpers
+# DATABASE helpers
 # -------------------------
 async def init_db():
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            """CREATE TABLE IF NOT EXISTS users (
-                   user_id INTEGER PRIMARY KEY,
-                   balance INTEGER NOT NULL,
-                   last_daily INTEGER
-               )"""
-        )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER NOT NULL DEFAULT 0,
+                last_daily INTEGER DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS fish (
+                user_id INTEGER PRIMARY KEY,
+                fish_count INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS items (
+                user_id INTEGER,
+                item_name TEXT,
+                amount INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, item_name)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cooldowns (
+                user_id INTEGER PRIMARY KEY,
+                last_nuke INTEGER DEFAULT 0
+            )
+        """)
         await db.commit()
 
 async def ensure_user(user_id: int):
     async with aiosqlite.connect(DATABASE) as db:
-        cur = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-        row = await cur.fetchone()
-        if row is None:
-            await db.execute(
-                "INSERT INTO users (user_id, balance, last_daily) VALUES (?, ?, ?)",
-                (user_id, STARTING_BALANCE, 0)
-            )
+        cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+        if not await cur.fetchone():
+            await db.execute("INSERT INTO users (user_id, balance, last_daily) VALUES (?, ?, 0)",
+                             (user_id, STARTING_BALANCE))
+            await db.execute("INSERT INTO fish (user_id, fish_count) VALUES (?, 0)", (user_id,))
+            await db.execute("INSERT INTO cooldowns (user_id, last_nuke) VALUES (?, 0)", (user_id,))
             await db.commit()
 
+# balance helpers
 async def get_balance(user_id: int) -> int:
     async with aiosqlite.connect(DATABASE) as db:
         cur = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
         row = await cur.fetchone()
-        return row[0] if row else 0
+        return int(row[0]) if row else 0
 
 async def add_balance(user_id: int, amount: int):
     await ensure_user(user_id)
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (int(amount), user_id))
         await db.commit()
 
 async def set_balance(user_id: int, amount: int):
     await ensure_user(user_id)
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (amount, user_id))
+        await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (int(amount), user_id))
         await db.commit()
 
-async def get_last_daily(user_id: int) -> int:
+# fish helpers
+async def get_fish(user_id: int) -> int:
     async with aiosqlite.connect(DATABASE) as db:
-        cur = await db.execute("SELECT last_daily FROM users WHERE user_id = ?", (user_id,))
+        cur = await db.execute("SELECT fish_count FROM fish WHERE user_id = ?", (user_id,))
         row = await cur.fetchone()
-        return row[0] if row and row[0] else 0
+        return int(row[0]) if row else 0
 
-async def set_last_daily(user_id: int, ts: int):
+async def add_fish(user_id: int, amount: int):
     await ensure_user(user_id)
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("UPDATE users SET last_daily = ? WHERE user_id = ?", (ts, user_id))
+        await db.execute("UPDATE fish SET fish_count = fish_count + ? WHERE user_id = ?", (int(amount), user_id))
         await db.commit()
 
-async def top_balances(limit: int = 10):
+async def set_fish(user_id: int, amount: int):
+    await ensure_user(user_id)
+    amount = max(0, int(amount))
     async with aiosqlite.connect(DATABASE) as db:
-        cur = await db.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT ?", (limit,))
+        await db.execute("UPDATE fish SET fish_count = ? WHERE user_id = ?", (amount, user_id))
+        await db.commit()
+
+# items helpers
+async def get_item(user_id: int, item_name: str) -> int:
+    async with aiosqlite.connect(DATABASE) as db:
+        cur = await db.execute("SELECT amount FROM items WHERE user_id = ? AND item_name = ?", (user_id, item_name))
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+async def add_item(user_id: int, item_name: str, amount: int):
+    await ensure_user(user_id)
+    current = await get_item(user_id, item_name)
+    async with aiosqlite.connect(DATABASE) as db:
+        if current == 0:
+            await db.execute("INSERT OR REPLACE INTO items (user_id, item_name, amount) VALUES (?, ?, ?)",
+                             (user_id, item_name, int(amount)))
+        else:
+            await db.execute("UPDATE items SET amount = amount + ? WHERE user_id = ? AND item_name = ?",
+                             (int(amount), user_id, item_name))
+        await db.commit()
+
+async def set_item(user_id: int, item_name: str, amount: int):
+    await ensure_user(user_id)
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("INSERT OR REPLACE INTO items (user_id, item_name, amount) VALUES (?, ?, ?)",
+                         (user_id, item_name, int(amount)))
+        await db.commit()
+
+# cooldown helpers
+async def get_last_nuke(user_id: int) -> int:
+    async with aiosqlite.connect(DATABASE) as db:
+        cur = await db.execute("SELECT last_nuke FROM cooldowns WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+async def set_last_nuke(user_id: int, ts: int):
+    await ensure_user(user_id)
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("UPDATE cooldowns SET last_nuke = ? WHERE user_id = ?", (int(ts), user_id))
+        await db.commit()
+
+# leaderboard helpers
+async def top_fish(limit: int = 10):
+    async with aiosqlite.connect(DATABASE) as db:
+        cur = await db.execute("SELECT user_id, fish_count FROM fish ORDER BY fish_count DESC LIMIT ?", (limit,))
         rows = await cur.fetchall()
         return rows
 
 # -------------------------
-# Slot helpers
-# -------------------------
-def spin_reels():
-    return [random.choice(REELS) for _ in range(3)]
-
-def evaluate_spin(reels, bet):
-    a, b, c = reels
-    if a == b == c == "7️⃣":
-        return "jackpot_777", PAYOUTS["jackpot_777"] * bet
-    if a == b == c == "🍀":
-        return "lucky_clover", PAYOUTS["lucky_clover"] * bet
-    if a == b == c:
-        return "three_same", PAYOUTS["three_same"] * bet
-    if a == b or a == c or b == c:
-        return "two_same", PAYOUTS["two_same"] * bet
-    return "none", 0
-
-# -------------------------
-# Bot events
+# BOT EVENTS
 # -------------------------
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+    print(f"✅ FishNuke bot online as {bot.user} (id: {bot.user.id})")
     await init_db()
 
-    # --- Auto-give Admin role 777 ---
-    for guild in bot.guilds:
-        member = guild.get_member(YOUR_DISCORD_ID)
-        if member:
-            role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
-            if not role:
-                role = await guild.create_role(name=ADMIN_ROLE, permissions=discord.Permissions.all())
-            if role not in member.roles:
-                await member.add_roles(role)
-                print(f"✅ Added Admin role '{ADMIN_ROLE}' to {member.display_name}")
-
 # -------------------------
-# Commands
+# COMMANDS
 # -------------------------
-@bot.command()
-async def balance(ctx, member: discord.Member = None):
+@bot.command(name="balance")
+async def cmd_balance(ctx, member: discord.Member = None):
     target = member or ctx.author
     await ensure_user(target.id)
     bal = await get_balance(target.id)
     await ctx.send(f"💰 {target.display_name} has **{bal:,}** coins.")
 
-@bot.command()
-@commands.has_role(ADMIN_ROLE)
-async def give(ctx, member: discord.Member, amount: int):
-    if amount <= 0:
-        return await ctx.send("Amount must be positive.")
-    await add_balance(member.id, amount)
-    await ctx.send(f"✅ Gave **{amount:,}** coins to {member.display_name}.")
-
-@give.error
-async def give_error(ctx, error):
-    if isinstance(error, commands.MissingRole):
-        await ctx.send("❌ You don't have permission to use this command.")
-
-@bot.command()
-@commands.has_role(ADMIN_ROLE)
-async def setbalance(ctx, member: discord.Member, amount: int):
-    if amount < 0:
-        return await ctx.send("Balance cannot be negative.")
-    await set_balance(member.id, amount)
-    await ctx.send(f"✅ Set {member.display_name}'s balance to **{amount:,}** coins.")
-
-@bot.command()
-async def daily(ctx):
-    import time
+@bot.command(name="daily")
+async def cmd_daily(ctx):
     await ensure_user(ctx.author.id)
     now = int(time.time())
-    last = await get_last_daily(ctx.author.id)
+    last = await get_balance_last_daily(ctx.author.id) if False else None  # replaced by get_last_daily below
+    # we'll store last_daily in users table; reuse functions
+    async with aiosqlite.connect(DATABASE) as db:
+        cur = await db.execute("SELECT last_daily FROM users WHERE user_id = ?", (ctx.author.id,))
+        row = await cur.fetchone()
+        last = int(row[0]) if row and row[0] else 0
+
     if now - last < 86400:
         remaining = 86400 - (now - last)
         hrs = remaining // 3600
         mins = (remaining % 3600) // 60
         secs = remaining % 60
-        return await ctx.send(f"⏳ Already claimed daily. Try again in {hrs}h {mins}m {secs}s.")
+        return await ctx.send(f"⏳ You've already claimed daily. Try again in {hrs}h {mins}m {secs}s.")
     await add_balance(ctx.author.id, DAILY_REWARD)
-    await set_last_daily(ctx.author.id, now)
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("UPDATE users SET last_daily = ? WHERE user_id = ?", (now, ctx.author.id))
+        await db.commit()
     await ctx.send(f"✨ You claimed **{DAILY_REWARD:,}** coins!")
 
-@bot.command()
-async def leaderboard(ctx):
-    rows = await top_balances(10)
-    if not rows:
-        return await ctx.send("No data yet.")
-    description = ""
-    pos = 1
-    for user_id, bal in rows:
-        member = ctx.guild.get_member(user_id)
-        name = member.display_name if member else f"<@{user_id}>"
-        description += f"**{pos}.** {name} — {bal:,}\n"
-        pos += 1
-    embed = discord.Embed(title="🏆 Leaderboard", description=description, color=0xFFD700)
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def slots(ctx, bet: int):
-    if bet <= 0:
-        return await ctx.send("Bet must be positive.")
+@bot.command(name="fish")
+@commands.cooldown(1, 15, commands.BucketType.user)  # 15s cooldown per user
+async def cmd_fish(ctx):
     await ensure_user(ctx.author.id)
-    bal = await get_balance(ctx.author.id)
-    if bet > bal:
-        return await ctx.send("You don't have enough coins to bet that much.")
-    await add_balance(ctx.author.id, -bet)
-    message = await ctx.send("Spinning... 🎰")
-    await asyncio.sleep(1)
-
-    # --- Admin auto-jackpot ---
-    is_admin = discord.utils.get(ctx.author.roles, name=ADMIN_ROLE)
-    reels = ["7️⃣", "7️⃣", "7️⃣"] if is_admin else spin_reels()
-
-    outcome, payout = evaluate_spin(reels, bet)
-    if payout > 0:
-        await add_balance(ctx.author.id, payout)
-        result_text = f"🎉 **You won {payout:,} coins!** ({outcome})"
+    caught = random.randint(1, MAX_CATCH)
+    # chance for rare big catch
+    if random.random() < 0.05:
+        bonus = random.randint(5, 15)
+        caught += bonus
+        note = f" — huge catch! +{bonus}"
     else:
-        result_text = "😢 No win this time. Better luck next spin!"
+        note = ""
+    await add_fish(ctx.author.id, caught)
+    await ctx.send(f"🎣 {ctx.author.display_name} caught **{caught}** fish{note}!")
 
-    final = f"{' | '.join(reels)}\n{result_text}\nYour balance: **{(await get_balance(ctx.author.id)):,}**"
-    await message.edit(content=final)
+@cmd_fish.error
+async def cmd_fish_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ You're fishing too fast. Try again in {error.retry_after:.0f}s.")
 
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-    await bot.process_commands(message)
-
-# -------------------------
-# Start bot
-# -------------------------
-if __name__ == "__main__":
-    token = os.getenv("TOKEN")
-    if not token:
-        print("ERROR: TOKEN environment variable not set.")
-    else:
-        bot.run(token)
+@bot.command(name="inventory")
+async def cmd_inventory(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    await ensure_user(target.id)
+    fish = await get_fish(target.id)
+    nu
